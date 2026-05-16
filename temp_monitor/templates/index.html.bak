@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="/static/js/chart-helper.js"></script>
+    <title>Temperature Monitor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .card {
+            background-color: #f9f9f9;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .temperature {
+            font-size: 48px;
+            font-weight: bold;
+            text-align: center;
+            margin: 20px 0;
+        }
+        .timestamp {
+            text-align: center;
+            color: #666;
+            font-size: 14px;
+        }
+        .refresh-btn {
+            display: block;
+            width: 100%;
+            padding: 10px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .history {
+            margin-top: 30px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Temperature Monitor</h1>
+    
+    <div class="card">
+        <h2>Current Temperature</h2>
+        <div class="temperature" id="current-temp">--.-°C</div>
+        <div class="timestamp" id="timestamp">--</div>
+        <button class="refresh-btn" onclick="getCurrentTemperature()">Refresh</button>
+    </div>
+    
+    <div class="card history">
+        <h2>Recent History</h2>
+        <div id="history-data">Loading...</div>
+    </div>
+
+<div class="card">
+    <h2>Temperature Statistics (24h)</h2>
+    <div id="stats-data">Loading...</div>
+</div>
+
+<div class="card">
+    <h2>Temperature Prediction</h2>
+    <div id="prediction-data">Loading...</div>
+</div>
+
+<div class="card">
+    <h2>Temperature Chart</h2>
+    <div style="height: 300px;">
+        <canvas id="temperature-chart"></canvas>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Prediction Chart</h2>
+    <div style="height: 300px;">
+        <canvas id="prediction-chart"></canvas>
+    </div>
+</div>
+
+    <script>
+    // 获取当前温度
+    function getCurrentTemperature() {
+        fetch('/api/temperature/current')
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById('current-temp').innerText = data.temperature.toFixed(1) + '°C';
+                    
+                    // 格式化时间戳
+                    const timestamp = new Date(data.timestamp);
+                    document.getElementById('timestamp').innerText = 
+                        'Last updated: ' + timestamp.toLocaleString();
+                } else {
+                    document.getElementById('current-temp').innerText = 'Error';
+                    document.getElementById('timestamp').innerText = 'Failed to get temperature';
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                document.getElementById('current-temp').innerText = 'Error';
+                document.getElementById('timestamp').innerText = 'Connection error';
+            });
+    }
+    
+    // 获取历史数据
+    function getTemperatureHistory() {
+        fetch('/api/temperature/history?limit=10')
+            .then(response => response.json())
+            .then(data => {
+                if (data.success && data.data.length > 0) {
+                    let historyHtml = '<table style="width:100%; border-collapse: collapse;">';
+                    historyHtml += '<tr><th style="text-align: left; padding: 8px; border-bottom: 1px solid #ddd;">Time</th><th style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">Temperature</th></tr>';
+                    
+                    data.data.forEach(item => {
+                        const timestamp = new Date(item.timestamp);
+                        historyHtml += `<tr>
+                            <td style="padding: 8px; border-bottom: 1px solid #ddd;">${timestamp.toLocaleString()}</td>
+                            <td style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">${item.temperature.toFixed(1)}°C</td>
+                        </tr>`;
+                    });
+                    
+                    historyHtml += '</table>';
+                    document.getElementById('history-data').innerHTML = historyHtml;
+                } else {
+                    document.getElementById('history-data').innerText = 'No history data available';
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                document.getElementById('history-data').innerText = 'Error loading history data';
+            });
+    }
+
+
+// 获取温度统计信息
+function getTemperatureStats() {
+    fetch('/api/temperature/stats?hours=24')
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                let statsHtml = '<table style="width:100%; border-collapse: collapse;">';
+                statsHtml += `
+                    <tr>
+                        <td style="padding: 8px; border-bottom: 1px solid #ddd;">Period</td>
+                        <td style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">${data.period}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; border-bottom: 1px solid #ddd;">Minimum</td>
+                        <td style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">${data.stats.min.toFixed(1)}°C</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; border-bottom: 1px solid #ddd;">Maximum</td>
+                        <td style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">${data.stats.max.toFixed(1)}°C</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; border-bottom: 1px solid #ddd;">Average</td>
+                        <td style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">${data.stats.mean.toFixed(1)}°C</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; border-bottom: 1px solid #ddd;">Standard Deviation</td>
+                        <td style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">${data.stats.std.toFixed(2)}°C</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; border-bottom: 1px solid #ddd;">Data Points</td>
+                        <td style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">${data.stats.count}</td>
+                    </tr>
+                `;
+                statsHtml += '</table>';
+                document.getElementById('stats-data').innerHTML = statsHtml;
+            } else {
+                document.getElementById('stats-data').innerText = 'Statistics not available';
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            document.getElementById('stats-data').innerText = 'Error loading statistics';
+        });
+}
+
+// 获取温度预测
+function getTemperaturePrediction() {
+    fetch('/api/temperature/predict?hours=3')
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                let predictionHtml = '<table style="width:100%; border-collapse: collapse;">';
+                predictionHtml += '<tr><th style="text-align: left; padding: 8px; border-bottom: 1px solid #ddd;">Time</th><th style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">Predicted Temperature</th></tr>';
+                
+                data.predictions.forEach(prediction => {
+                    const timestamp = new Date(prediction.timestamp);
+                    predictionHtml += `<tr>
+                        <td style="padding: 8px; border-bottom: 1px solid #ddd;">${timestamp.toLocaleString()}</td>
+                        <td style="text-align: right; padding: 8px; border-bottom: 1px solid #ddd;">${prediction.predicted_temperature.toFixed(1)}°C</td>
+                    </tr>`;
+                });
+                
+                predictionHtml += '</table>';
+                document.getElementById('prediction-data').innerHTML = predictionHtml;
+            } else {
+                document.getElementById('prediction-data').innerText = 'Prediction not available: ' + (data.error || 'Unknown error');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            document.getElementById('prediction-data').innerText = 'Error loading prediction';
+        });
+}
+
+    
+    // 页面加载时获取数据
+    document.addEventListener('DOMContentLoaded', function() {
+        getCurrentTemperature();
+        getTemperatureHistory();
+	getTemperatureStats();
+	getTemperaturePrediction();
+    
+    // 定时刷新数据
+    setInterval(getCurrentTemperature, 60000);
+    setInterval(getTemperatureHistory, 300000);  // 5分钟更新一次历史数据
+    setInterval(getTemperatureStats, 300000);    // 5分钟更新一次统计数据
+    setInterval(getTemperaturePrediction, 300000); // 5分钟更新一次预测数据
+
+    });
+    
+function loadTemperatureChart() {
+        fetch('/api/temperature/chart-data?hours=12')
+            .then(response => response.json())
+            .then(data => {
+                if (data.success && data.data.length > 0) {
+                    drawTemperatureChart('temperature-chart', data.data);
+                } else {
+                    document.getElementById('temperature-chart').getContext('2d').clearRect(0, 0,
+                        document.getElementById('temperature-chart').width,
+                        document.getElementById('temperature-chart').height);
+                    document.getElementById('temperature-chart').parentNode.innerHTML =
+                        '<div style="text-align: center; padding: 20px;">No chart data available</div>';
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+            });
+    }
+
+    // 加载预测图表
+    function loadPredictionChart() {
+        // 首先获取历史数据
+        fetch('/api/temperature/chart-data?hours=4')
+            .then(response => response.json())
+            .then(historyData => {
+                if (historyData.success && historyData.data.length > 0) {
+                    // 然后获取预测数据
+                    fetch('/api/temperature/predict?hours=1')
+                        .then(response => response.json())
+                        .then(predictionData => {
+                            if (predictionData.success) {
+                                drawPredictionChart('prediction-chart',
+                                                   historyData.data,
+                                                   predictionData);
+                            } else {
+                                document.getElementById('prediction-chart').parentNode.innerHTML =
+                                    '<div style="text-align: center; padding: 20px;">Prediction data not available</div>';
+                            }
+                        })
+                        .catch(error => {
+                            console.error('Error:', error);
+                        });
+                } else {
+                    document.getElementById('prediction-chart').parentNode.innerHTML =
+                        '<div style="text-align: center; padding: 20px;">No chart data available</div>';
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+            });
+    }
+
+    // 更新或添加DOMContentLoaded事件处理程序
+    document.addEventListener('DOMContentLoaded', function() {
+        // 现有的函数调用...
+        getCurrentTemperature();
+        getTemperatureHistory();
+        getTemperatureStats();
+        getTemperaturePrediction();
+        
+        // 添加新的图表加载函数调用
+        loadTemperatureChart();
+        loadPredictionChart();
+        
+        // 定时刷新数据
+        setInterval(getCurrentTemperature, 60000);
+        setInterval(getTemperatureHistory, 300000);  // 5分钟更新一次历史数据
+        setInterval(getTemperatureStats, 300000);    // 5分钟更新一次统计数据
+        setInterval(getTemperaturePrediction, 300000); // 5分钟更新一次预测数据
+        setInterval(loadTemperatureChart, 600000);   // 10分钟更新一次图表
+        setInterval(loadPredictionChart, 600000);    // 10分钟更新一次预测图表
+    });
+    </script>
+</body>
+</html>

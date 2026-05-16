@@ -1,0 +1,385 @@
+import tensorflow as tf
+from flask import Flask, jsonify, request, render_template
+import logging
+import os
+from datetime import datetime, timedelta
+from .database import Database
+from .sensor import TemperatureSensor
+from .data_processor import DataProcessor
+from .predictorS import TemperaturePredictor
+from flask_socketio import SocketIO
+import threading
+import time
+import psutil
+
+# 配置日志
+logging.basicConfig(
+    filename='logs/web_server.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+app = Flask(__name__,
+    template_folder='../templates',
+    static_folder='../static')
+
+# 初始化SocketIO
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+db = Database()
+sensor = TemperatureSensor()
+processor = DataProcessor()
+predictor = TemperaturePredictor()
+
+# 添加系统状态监控线程
+def system_monitor():
+    while True:
+        try:
+            # 获取系统信息
+            cpu_usage = psutil.cpu_percent(interval=1)
+            memory_info = psutil.virtual_memory()
+            disk_info = psutil.disk_usage('/')
+            
+            # 获取当前温度
+            temp = sensor.get_temperature()
+            
+            # 构建状态数据
+            status_data = {
+                'timestamp': datetime.now().isoformat(),
+                'system': {
+                    'cpu_usage': cpu_usage,
+                    'memory_usage': memory_info.percent,
+                    'disk_usage': disk_info.percent
+                }
+            }
+            
+            if temp is not None:
+                status_data['temperature'] = temp
+            
+            # 通过WebSocket发送状态数据
+            socketio.emit('system_status', status_data)
+            
+            # 每分钟发送一次
+            time.sleep(60)
+        except Exception as e:
+            logging.error(f"系统监控线程出错: {e}")
+            time.sleep(60)  # 出错时等待一分钟再试
+
+# 初始化模型训练线程
+def model_training_job():
+    while True:
+        try:
+            # 每6小时重新训练一次模型
+            logging.info("开始定期模型训练...")
+            predictor.train_model(training_days=7)
+            time.sleep(6 * 60 * 60)  # 6小时
+        except Exception as e:
+            logging.error(f"模型训练线程出错: {e}")
+            time.sleep(60 * 60)  # 出错时等待一小时再试
+
+@app.route('/')
+def index():
+    """渲染主页"""
+    return render_template('index.html')
+
+@app.route('/api/temperature/current', methods=['GET'])
+def get_current_temperature():
+    """获取当前温度"""
+    temp = sensor.get_temperature()
+    if temp is not None:
+        # 记录新的温度数据
+        db.insert_temperature(temp)
+        
+        # 通过WebSocket推送新数据
+        socketio.emit('new_temperature', {
+            'temperature': temp,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        return jsonify({
+            'success': True,
+            'temperature': temp,
+            'unit': 'celsius',
+            'timestamp': datetime.now().isoformat()
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'error': 'Failed to read temperature'
+        }), 500
+
+@app.route('/api/temperature/history', methods=['GET'])
+def get_temperature_history():
+    """获取历史温度数据 - 返回最新数据"""
+    start_time = request.args.get('start')
+    end_time = request.args.get('end')
+    limit = request.args.get('limit', default=10, type=int)
+    
+    # 如果没有指定时间范围，获取最新数据
+    if not start_time and not end_time:
+        data = db.get_latest_temperature_data(limit=limit)
+    else:
+        data = db.get_temperature_data(start_time, end_time, limit, order='DESC')
+        # 降序获取后反转以保持时间升序
+        data = list(reversed(data))
+    
+    # 格式化返回结果
+    result = []
+    for row in data:
+        timestamp_str = row[0]
+        temperature = row[1]
+        
+        # 标准化时间戳
+        try:
+            dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            timestamp_str = dt.isoformat()
+        except:
+            continue
+            
+        result.append({
+            'timestamp': timestamp_str,
+            'temperature': float(temperature)
+        })
+    
+    return jsonify({
+        'success': True,
+        'data': result,
+        'count': len(result)
+    })
+
+@app.route('/api/temperature/stats', methods=['GET'])
+def get_temperature_stats():
+    """获取温度统计信息"""
+    hours = request.args.get('hours', default=24, type=int)
+    
+    data = processor.get_recent_data(hours=hours)
+    
+    if not data:
+        return jsonify({
+            'success': False,
+            'error': '无数据可用'
+        }), 404
+    
+    stats = processor.calculate_statistics(data)
+    outliers = processor.detect_outliers(data)
+    outlier_count = sum(1 for _, _, is_outlier in outliers if is_outlier)
+    
+    return jsonify({
+        'success': True,
+        'period': f'最近{hours}小时',
+        'stats': stats,
+        'outlier_count': outlier_count
+    })
+
+@app.route('/api/temperature/predict', methods=['GET'])
+def predict_temperature():
+    """预测未来温度"""
+    hours_ahead = request.args.get('hours', default=3, type=int)
+    
+    data = db.get_temperature_data(
+        start_time=(datetime.now() - timedelta(hours=24)).isoformat(),
+        end_time=datetime.now().isoformat(),
+        limit=1000
+    )
+    
+    if len(data) < 24:
+        return jsonify({
+            'success': False,
+            'error': '数据不足，无法预测'
+        }), 400
+    
+    predictions = predictor.predict_next_hours(data, hours_ahead=hours_ahead)
+    
+    if not predictions:
+        return jsonify({
+            'success': False,
+            'error': '预测失败'
+        }), 500
+    
+    result = [{
+        'timestamp': timestamp,
+        'predicted_temperature': temp
+    } for timestamp, temp in predictions]
+    
+    return jsonify({
+        'success': True,
+        'predictions': result,
+        'hours_ahead': hours_ahead
+    })
+
+@app.route('/api/temperature/chart-data', methods=['GET'])
+def get_chart_data():
+    """获取图表数据 - 确保返回最新数据"""
+    hours = request.args.get('hours', default=12, type=int)
+    logging.info(f"请求的时间范围: {hours}小时")
+    
+    # 使用相对时间过滤获取最新数据
+    data = processor.get_recent_data(hours=hours, use_relative_time=True)
+    logging.info(f"查询到的数据条数: {len(data) if data else 0}")
+    
+    if not data:
+        return jsonify({
+            'success': False,
+            'error': '无数据可用'
+        }), 404
+    
+    # 数据平滑处理
+    smoothed_data = processor.smooth_data(data, window_size=3)
+    
+    # 构建响应，确保时间戳格式一致
+    result = []
+    for timestamp, temp in smoothed_data:
+        try:
+            # 验证时间戳格式
+            if isinstance(timestamp, str):
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                timestamp = dt.isoformat()
+            result.append({
+                'timestamp': timestamp,
+                'temperature': float(temp)
+            })
+        except Exception as e:
+            logging.warning(f"跳过无效数据点: {e}")
+            continue
+    
+    # 按时间排序
+    result.sort(key=lambda x: x['timestamp'])
+    
+    # 如果数据点太多，进行采样
+    if len(result) > 200:
+        result = processor.sample_data(result, max_points=200)
+    
+    return jsonify({
+        'success': True,
+        'data': result,
+        'count': len(result)
+    })
+
+@app.route('/api/model/evaluate', methods=['GET'])
+def evaluate_model():
+    """评估预测模型性能"""
+    test_size = request.args.get('test_size', default=48, type=int)
+    
+    evaluation = predictor.evaluate_model(test_size=test_size)
+    
+    if 'error' in evaluation:
+        return jsonify({
+            'success': False,
+            'error': evaluation['error']
+        }), 400
+    
+    return jsonify({
+        'success': True,
+        'evaluation': evaluation
+    })
+
+# 添加新路由：系统状态API
+@app.route('/api/system/status', methods=['GET'])
+def get_system_status():
+    """获取系统状态"""
+    try:
+        cpu_usage = psutil.cpu_percent()
+        memory_info = psutil.virtual_memory()
+        disk_info = psutil.disk_usage('/')
+        
+        # 获取数据库大小
+        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data/temperature.db')
+        db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+        
+        return jsonify({
+            'success': True,
+            'status': {
+                'cpu_usage': cpu_usage,
+                'memory': {
+                    'total': memory_info.total,
+                    'available': memory_info.available,
+                    'used_percent': memory_info.percent
+                },
+                'disk': {
+                    'total': disk_info.total,
+                    'free': disk_info.free,
+                    'used_percent': disk_info.percent
+                },
+                'database': {
+                    'size_bytes': db_size,
+                    'size_mb': db_size / (1024 * 1024)
+                },
+                'uptime': {
+                    'seconds': int(time.time() - psutil.boot_time()),
+                    'formatted': str(timedelta(seconds=int(time.time() - psutil.boot_time())))
+                }
+            }
+        })
+    except Exception as e:
+        logging.error(f"获取系统状态出错: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# 启动模型转换为TensorFlow Lite格式
+@app.route('/api/model/convert-to-tflite', methods=['POST'])
+def convert_to_tflite():
+    """将模型转换为TFLite格式"""
+    try:
+        # 确保模型存在
+        if not os.path.exists('models/lstm_model.h5'):
+            return jsonify({
+                'success': False,
+                'error': '模型文件不存在'
+            }), 404
+        
+        # 加载Keras模型
+        model = tf.keras.models.load_model('models/lstm_model.h5')
+        
+        # 转换为TFLite模型
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        tflite_model = converter.convert()
+        
+        # 保存TFLite模型
+        with open('models/model.tflite', 'wb') as f:
+            f.write(tflite_model)
+        
+        return jsonify({
+            'success': True,
+            'message': '模型成功转换为TFLite格式',
+            'model_path': 'models/model.tflite'
+        })
+    except Exception as e:
+        logging.error(f"模型转换出错: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# 启动后台线程
+@socketio.on('connect')
+def handle_connect():
+    logging.info(f"客户端已连接: {request.sid}")
+    
+    # 发送初始系统状态
+    cpu_usage = psutil.cpu_percent(interval=1)
+    socketio.emit('system_status', {
+        'timestamp': datetime.now().isoformat(),
+        'system': {
+            'cpu_usage': cpu_usage,
+            'memory_usage': psutil.virtual_memory().percent,
+            'disk_usage': psutil.disk_usage('/').percent
+        }
+    }, room=request.sid)
+
+# 主函数
+def main():
+    # 启动系统监控线程
+    monitor_thread = threading.Thread(target=system_monitor, daemon=True)
+    monitor_thread.start()
+    
+    # 启动模型训练线程
+    training_thread = threading.Thread(target=model_training_job, daemon=True)
+    training_thread.start()
+    
+    # 启动Web服务器（使用SocketIO）
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+
+if __name__ == '__main__':
+    main()

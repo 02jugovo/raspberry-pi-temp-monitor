@@ -1,0 +1,307 @@
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input, Attention, MultiHeadAttention
+import numpy as np
+import os
+import logging
+from datetime import datetime, timedelta
+from .database import Database
+
+class TemperaturePredictor:
+    def __init__(self, db_path='data/temperature.db'):
+        self.db = Database(db_path=db_path)
+        self.model = None
+        self.model_path = 'models/lstm_model.h5'
+        os.makedirs('models', exist_ok=True)
+        
+        # 尝试加载已存在的模型
+        if os.path.exists(self.model_path):
+            try:
+                self.model = tf.keras.models.load_model(self.model_path)
+                logging.info("加载现有LSTM模型成功")
+            except:
+                logging.error("加载模型失败，将重新训练")
+                self.model = None
+                
+    def get_training_data(self, days=7):
+        """获取训练数据
+        
+        Args:
+            days (int): 最近几天的数据，默认7天
+            
+        Returns:
+            list: 温度数据列表
+        """
+        end_time = datetime.now().isoformat()
+        start_time = (datetime.now() - timedelta(days=days)).isoformat()
+        
+        return self.db.get_temperature_data(start_time, end_time, limit=1000)
+
+    
+    def prepare_data(self, data, sequence_length=24, prediction_steps=6):
+        """准备LSTM模型的数据
+        Args:
+            data (list): [(timestamp, temperature)] 数据列表
+            sequence_length (int): 输入序列长度，默认24（12小时数据，假设30分钟/点）
+            prediction_steps (int): 预测步数，默认6（3小时，假设30分钟/点）
+        Returns:
+            tuple: (X, y) 输入序列和目标值
+        """
+        if len(data) < sequence_length + prediction_steps:
+            return None, None
+        
+        temperatures = [item[1] for item in data]
+        
+        # 归一化处理
+        mean = np.mean(temperatures)
+        std = np.std(temperatures)
+        normalized_temps = [(t - mean) / std for t in temperatures]
+        
+        X, y = [], []
+        for i in range(len(normalized_temps) - sequence_length - prediction_steps + 1):
+            X.append(normalized_temps[i:i+sequence_length])
+            y.append(normalized_temps[i+sequence_length:i+sequence_length+prediction_steps])
+        
+        return np.array(X), np.array(y), mean, std
+    
+    def build_attention_lstm_model(self, input_shape, output_steps):
+        """构建带注意力机制的LSTM模型"""
+        inputs = Input(shape=input_shape)
+        
+        # 第一个LSTM层
+        lstm1 = LSTM(64, return_sequences=True)(inputs)
+        dropout1 = Dropout(0.3)(lstm1)
+        
+        # 注意力机制
+        attention = MultiHeadAttention(num_heads=2, key_dim=32)(dropout1, dropout1)
+        
+        # 第二个LSTM层
+        lstm2 = LSTM(32)(attention)
+        dropout2 = Dropout(0.3)(lstm2)
+        
+        # 输出层
+        outputs = Dense(output_steps)(dropout2)
+        
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss='mse',
+            metrics=['mae', 'mse']
+        )
+        
+        return model
+    
+    def train_model(self, training_days=7, sequence_length=24, prediction_steps=6, epochs=50):
+        """训练LSTM模型"""
+        # 获取训练数据
+        data = self.get_training_data(days=training_days)
+        if len(data) < 100:
+            logging.error("训练数据不足，无法训练模型")
+            return False
+        
+        # 准备训练数据
+        X, y, mean, std = self.prepare_data(data, sequence_length, prediction_steps)
+        if X is None:
+            logging.error("准备训练数据失败")
+            return False
+        
+        # 构建模型
+        self.model = self.build_attention_lstm_model(
+            input_shape=(sequence_length, 1), 
+            output_steps=prediction_steps
+        )
+        
+        # 重塑数据形状以适应LSTM输入
+        X = X.reshape(X.shape[0], X.shape[1], 1)
+        
+        # 添加早停策略
+        early_stopping = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=10, restore_best_weights=True
+        )
+        
+        # 训练模型
+        history = self.model.fit(
+            X, y,
+            epochs=epochs,
+            validation_split=0.2,
+            batch_size=32,
+            callbacks=[early_stopping],
+            verbose=1
+        )
+        
+        # 保存模型和归一化参数
+        self.model.save(self.model_path)
+        self.db.set_config('model_mean', str(mean))
+        self.db.set_config('model_std', str(std))
+        
+        # 记录训练指标
+        final_loss = history.history['loss'][-1]
+        final_mae = history.history['mae'][-1]
+        logging.info(f"模型训练完成，最终损失：{final_loss:.4f}，MAE：{final_mae:.4f}")
+        
+        return True
+    
+    def predict_next_hours(self, recent_data, hours_ahead=3, sequence_length=24):
+        """预测未来几小时的温度
+        Args:
+            recent_data (list): [(timestamp, temperature)] 最近的数据
+            hours_ahead (int): 预测未来小时数，默认3
+            sequence_length (int): 用于预测的序列长度，默认24
+        Returns:
+            list: [(timestamp, predicted_temperature)] 预测结果列表
+        """
+        if len(recent_data) < sequence_length:
+            logging.error(f"数据不足，无法预测。需要{sequence_length}条，实际{len(recent_data)}条")
+            return []
+        
+        # 若模型不存在，尝试训练
+        if self.model is None:
+            success = self.train_model()
+            if not success:
+                return self._fallback_prediction(recent_data, hours_ahead)
+        
+        # 获取归一化参数
+        mean = float(self.db.get_config('model_mean', '0'))
+        std = float(self.db.get_config('model_std', '1'))
+        
+        # 提取最近的温度数据
+        recent_temperatures = [item[1] for item in recent_data[-sequence_length:]]
+        
+        # 归一化
+        normalized_temps = [(t - mean) / std for t in recent_temperatures]
+        
+        # 重塑输入形状
+        X_pred = np.array([normalized_temps]).reshape(1, sequence_length, 1)
+        
+        # 计算每小时的数据点数（假设30分钟一个点）
+        points_per_hour = 2
+        
+        # 计算需要预测的步数
+        prediction_steps = int(hours_ahead * points_per_hour)
+        
+        # 递归预测
+        predictions = []
+        last_timestamp = datetime.fromisoformat(recent_data[-1][0])
+        
+        # 分批预测（因为模型输出固定步数）
+        steps_done = 0
+        pred_temps = []
+        
+        while steps_done < prediction_steps:
+            # 预测下一组时间点
+            model_output = self.model.predict(X_pred, verbose=0)
+            
+            # 模型可能输出多步预测，取需要的部分
+            steps_to_use = min(model_output.shape[1], prediction_steps - steps_done)
+            
+            for i in range(steps_to_use):
+                # 反归一化
+                next_temp = model_output[0][i] * std + mean
+                
+                # 添加到预测结果
+                next_timestamp = last_timestamp + timedelta(minutes=(steps_done + i + 1) * 30)
+                predictions.append((next_timestamp.isoformat(), float(next_temp)))
+                pred_temps.append(float(next_temp))
+            
+            # 更新已完成的步数
+            steps_done += steps_to_use
+            
+            # 更新输入序列用于下一次预测
+            if steps_done < prediction_steps:
+                # 移除最旧的值并添加预测值
+                normalized_temps = normalized_temps[steps_to_use:] + [(t - mean) / std for t in pred_temps[-steps_to_use:]]
+                X_pred = np.array([normalized_temps]).reshape(1, sequence_length, 1)
+        
+        return predictions
+    
+    def _fallback_prediction(self, recent_data, hours_ahead):
+        """简单的线性预测（当LSTM模型不可用时的备选方案）"""
+        if len(recent_data) < 2:
+            return []
+        
+        # 提取最近的温度
+        recent_temperatures = [item[1] for item in recent_data[-12:]]  # 使用最近6小时的数据
+        
+        # 计算变化趋势
+        if len(recent_temperatures) >= 2:
+            changes = [recent_temperatures[i] - recent_temperatures[i-1] for i in range(1, len(recent_temperatures))]
+            avg_change = sum(changes) / len(changes)
+        else:
+            avg_change = 0
+        
+        # 预测未来温度
+        last_temp = recent_temperatures[-1]
+        last_timestamp = datetime.fromisoformat(recent_data[-1][0])
+        
+        predictions = []
+        for i in range(1, int(hours_ahead * 2) + 1):  # 假设每30分钟一个数据点
+            next_temp = last_temp + avg_change * i
+            next_timestamp = last_timestamp + timedelta(minutes=i*30)
+            predictions.append((next_timestamp.isoformat(), next_temp))
+        
+        logging.warning("使用备选线性预测方法")
+        return predictions
+    
+    def evaluate_model(self, test_size=48):
+        """评估预测模型的准确性
+        Args:
+            test_size (int): 测试数据大小
+        Returns:
+            dict: 包含评估结果的字典
+        """
+        data = self.get_training_data(days=10)
+        if len(data) < test_size + 24:
+            return {"error": "数据不足，无法评估"}
+        
+        # 分割训练集和测试集
+        train_data = data[:-test_size]
+        test_data = data[-test_size:]
+        
+        # 确保模型已加载
+        if self.model is None:
+            # 尝试使用训练集训练模型
+            success = self.train_model()
+            if not success:
+                return {"error": "模型训练失败"}
+        
+        # 在测试集上进行预测
+        actual_values = []
+        predicted_values = []
+        
+        for i in range(0, test_size, 6):  # 每3小时（6个数据点）评估一次
+            if i + 24 >= test_size:
+                break
+                
+            # 获取输入序列
+            input_data = test_data[i:i+24]
+            
+            # 预测接下来的值
+            predictions = self.predict_next_hours(input_data, hours_ahead=3)
+            
+            # 获取实际值
+            for j in range(min(len(predictions), 6)):
+                if i + 24 + j < len(test_data):
+                    actual_values.append(test_data[i+24+j][1])
+                    predicted_values.append(predictions[j][1])
+        
+        if not actual_values:
+            return {"error": "未生成有效预测"}
+        
+        # 计算评估指标
+        mae = np.mean(np.abs(np.array(actual_values) - np.array(predicted_values)))
+        mse = np.mean((np.array(actual_values) - np.array(predicted_values)) ** 2)
+        rmse = np.sqrt(mse)
+        
+        # 计算R²
+        y_mean = np.mean(actual_values)
+        ss_total = sum((y - y_mean) ** 2 for y in actual_values)
+        ss_residual = sum((y_true - y_pred) ** 2 for y_true, y_pred in zip(actual_values, predicted_values))
+        r_squared = 1 - (ss_residual / ss_total) if ss_total != 0 else 0
+        
+        return {
+            "mae": mae,
+            "mse": mse,
+            "rmse": rmse,
+            "r_squared": r_squared,
+            "test_size": len(actual_values)
+        }
